@@ -1,0 +1,19 @@
+# secrets ? NEVER publish
+.env
+.env.*
+
+# local machine data ? private
+app/data/
+app/
+
+# python build artifacts
+__pycache__/
+*.pyc
+
+# dev backups
+*.bak_*
+*.bak
+
+# staged update temp files
+*.staged
+VERSION.staged
