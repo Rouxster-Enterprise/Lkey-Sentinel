@@ -1,14 +1,14 @@
 # 🛡️ Lkey Sentinel
 
-A featherweight guardian for powerful-but-unstable Windows gaming rigs.
+A featherweight guardian for any Windows PC.
 
-Lkey Sentinel sits quietly in the background, sips telemetry on a slow timer, and does three things:
+Lkey Sentinel sits quietly in the background, sips telemetry on a slow timer, and makes any machine easier to monitor, debug, and maintain — whether it's a gaming rig, a workstation, a creator's setup, or a computer you look after for someone else. It does three things:
 
-- **Warns before trouble** — watches GPU/CPU temps, RAM, and VRAM, and alerts you *before* a crash when the machine enters the danger zone ("VRAM 94% — save your game").
-- **Catches crashes** — the moment a program or game dies, it cross-checks the Windows Event Log, records **why** (the faulting module) and the machine's vital signs in the seconds before death, and pings you.
-- **Stays out of the way** — a few MB of footprint, read-only toward the system. It never throttles, kills, or touches your games, launchers, anti-cheat, or anything you're actively using.
+- **Warns before trouble** — watches GPU/CPU temps, RAM, and VRAM, and alerts you *before* a crash when the machine enters the danger zone ("VRAM 94% — save your work").
+- **Catches crashes** — the moment a program or game dies, it cross-checks the Windows Event Log, records **why** (the faulting module) along with the machine's vital signs in the seconds before the crash, and pings you — so the cause is visible, even remotely.
+- **Stays out of the way** — a few MB of footprint, read-only toward your system. It never throttles, kills, or touches your programs, games, launchers, anti-cheat, or anything you're actively using.
 
-It cannot fix hardware faults — it gives you **early warning** and a **black box** so the real cause is visible, even remotely.
+It cannot fix hardware faults — it gives you **early warning** and a **black box** so the real cause is visible, whether the machine is in front of you or across the country.
 
 ## Quick start
 
