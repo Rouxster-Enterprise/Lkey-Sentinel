@@ -338,6 +338,7 @@ def watch(cfg, notify=None, stop=lambda: False):
                      "You'll get a message here if anything gets dangerous."):
         say("   📡 Telegram link confirmed — startup ping sent to you.")
     last_alert = 0
+    last_alert_sig = ""
     prev_procs = _running_procs()   # baseline for crash detection
     while not stop():
         s = sample()
@@ -353,11 +354,16 @@ def watch(cfg, notify=None, stop=lambda: False):
         alerts = evaluate(s, cfg)
         if alerts:
             now = time.time()
-            if now - last_alert > 20:   # don't spam; one alert / 20s
+            # signature of WHICH conditions are firing (e.g. "VRAM;RAM")
+            sig = ";".join(sorted(lvl_msg[1].split()[0] for lvl_msg in alerts))
+            # only alert if: it's a NEW/changed condition, OR the cooldown passed
+            # (sustained conditions like gaming warn ONCE, not every 20s)
+            cooldown = cfg.get("alert_cooldown_seconds", 600)  # 10 min default
+            new_condition = (sig != last_alert_sig)
+            if new_condition or (now - last_alert > cooldown):
                 for lvl, msg in alerts:
                     say(f"⚠️ {msg} — save your game / expect instability")
                 write_blackbox(ring, alerts)
-                # ping YOU on Telegram (her machine can't read logs; you can)
                 summary = "; ".join(m for _, m in alerts)
                 try:
                     hogs = memory_hogs(top=5)
@@ -368,6 +374,9 @@ def watch(cfg, notify=None, stop=lambda: False):
                                  f"⚠️ {summary}\nState: {fmt(s)}{hog_line}"):
                     say("   📡 Telegram alert sent (with memory report).")
                 last_alert = now
+                last_alert_sig = sig
+        else:
+            last_alert_sig = ""   # conditions cleared — reset so it can warn again
         time.sleep(max(2, int(cfg["poll_seconds"])))
 
 
