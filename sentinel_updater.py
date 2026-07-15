@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 # --- CONFIG: the PUBLIC source this pulls from (read-only, no auth needed) ---
-RAW_BASE = "https://raw.githubusercontent.com/RouxsterEnterprise/Lkey-Sentinel/main"
+RAW_BASE = "https://raw.githubusercontent.com/Rouxster-Enterprise/Lkey-Sentinel/main"
 REMOTE_VERSION_URL = f"{RAW_BASE}/VERSION"
 REMOTE_CODE_URL = f"{RAW_BASE}/lkey_sentinel.py"
 
@@ -180,6 +180,25 @@ if __name__ == "__main__":
     if "--apply-staged" in sys.argv:
         applied = apply_staged_update()
         print("applied" if applied else "nothing staged")
+    elif "--update-now" in sys.argv:
+        # one obvious command: check + stage + apply immediately, no restart wait
+        result = check_for_updates(apply=True)
+        if result.startswith("staged:"):
+            print("Update staged. Applying now...")
+            if apply_staged_update():
+                print("✅ Update applied. Restart Sentinel to run the new version.")
+            else:
+                print("⚠️ Staged but couldn't apply — will apply on next Sentinel start.")
+        else:
+            print(f"Result: {result}")
     else:
         # check-only by default when run manually, so nothing surprises you
-        print(check_for_updates(apply="--go" in sys.argv))
+        if "--go" in sys.argv:
+            print(check_for_updates(apply=True))
+        else:
+            # bare run = check + tell the user how to actually apply
+            status = check_for_updates(apply=False)
+            print(status)
+            if status.startswith("available:"):
+                print("\n→ To download + apply this update, run:")
+                print("    python sentinel_updater.py --update-now")
