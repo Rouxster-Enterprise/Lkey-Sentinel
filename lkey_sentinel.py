@@ -578,10 +578,30 @@ def main():
                             pass
                 import threading as _th
                 _th.Thread(target=_do, daemon=True).start()
+            def _screenshot(icon, item):
+                def _do():
+                    try:
+                        from PIL import ImageGrab
+                        import os
+                        from datetime import datetime
+                        shots = os.path.join(os.path.expanduser("~"), "Pictures", "Lkey_Screenshots")
+                        os.makedirs(shots, exist_ok=True)  # make folder first (the snag we found)
+                        fname = os.path.join(shots, f"screenshot_{datetime.now():%Y%m%d_%H%M%S}.png")
+                        ImageGrab.grab().save(fname)
+                        state["last"] = f"\U0001f4f8 Saved: {os.path.basename(fname)}"
+                    except Exception as _e:
+                        state["last"] = f"Screenshot failed: {_e}"
+                    try:
+                        icon.update_menu()
+                    except Exception:
+                        pass
+                import threading as _th
+                _th.Thread(target=_do, daemon=True).start()
             icon = pystray.Icon("LkeySentinel", img, "Lkey Sentinel",
                                 menu=pystray.Menu(
                                     pystray.MenuItem(lambda i: state["last"], None, enabled=False),
                                     pystray.MenuItem("Check for updates", _check_updates),
+                                    pystray.MenuItem("\U0001f4f8 Screenshot", _screenshot),
                                     pystray.MenuItem("Free memory (safe)", _free_mem),
                                     pystray.MenuItem("Quit", _quit)))
             import threading
