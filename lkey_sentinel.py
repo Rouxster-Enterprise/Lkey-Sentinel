@@ -89,6 +89,31 @@ def send_telegram(text):
     except Exception:
         return False
 
+def send_telegram_photo(path, caption=""):
+    """[EYES-V2] Send an image to Telegram. Same philosophy as send_telegram:
+    stdlib-only multipart, silent skip when unconfigured, never raises."""
+    tok, chat = _load_telegram()
+    if not tok or not chat:
+        return False
+    try:
+        import urllib.request, uuid
+        data = Path(path).read_bytes()
+        b = uuid.uuid4().hex
+        body = b"".join([
+            f"--{b}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat}\r\n".encode(),
+            f"--{b}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption[:1000]}\r\n".encode(),
+            f"--{b}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"{Path(path).name}\"\r\n"
+            f"Content-Type: image/png\r\n\r\n".encode(), data, b"\r\n".encode(),
+            f"--{b}--\r\n".encode()])
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{tok}/sendPhoto", data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+        urllib.request.urlopen(req, timeout=20)
+        return True
+    except Exception:
+        return False
+
+
 DEFAULTS = {
     "poll_seconds": 5,          # slow + gentle; raise to 10 for even less load
     "gpu_temp_warn": 83,        # °C — 5090 throttles ~83-88; warn before that
@@ -578,17 +603,27 @@ def main():
                             pass
                 import threading as _th
                 _th.Thread(target=_do, daemon=True).start()
-            def _screenshot(icon, item):
+            def _screenshot(icon, item):          # [EYES-V2] all screens + reveal + telegram
                 def _do():
                     try:
                         from PIL import ImageGrab
                         import os
+                        import subprocess
                         from datetime import datetime
                         shots = os.path.join(os.path.expanduser("~"), "Pictures", "Lkey_Screenshots")
-                        os.makedirs(shots, exist_ok=True)  # make folder first (the snag we found)
+                        os.makedirs(shots, exist_ok=True)
                         fname = os.path.join(shots, f"screenshot_{datetime.now():%Y%m%d_%H%M%S}.png")
-                        ImageGrab.grab().save(fname)
+                        try:
+                            ImageGrab.grab(all_screens=True).save(fname)
+                        except TypeError:
+                            ImageGrab.grab().save(fname)   # older PIL: primary screen only
                         state["last"] = f"\U0001f4f8 Saved: {os.path.basename(fname)}"
+                        try:  # reveal in Explorer with the new file selected — no hunting
+                            subprocess.Popen(["explorer", "/select,", os.path.normpath(fname)])
+                        except Exception:
+                            pass
+                        if send_telegram_photo(fname, f"\U0001f4f8 {machine_label()} screenshot"):
+                            state["last"] += " + sent to Telegram"
                     except Exception as _e:
                         state["last"] = f"Screenshot failed: {_e}"
                     try:
@@ -597,11 +632,25 @@ def main():
                         pass
                 import threading as _th
                 _th.Thread(target=_do, daemon=True).start()
+
+            def _open_caps(icon=None, item=None):   # [EYES-V2]
+                import os as _os
+                import subprocess as _sp
+                d = _os.path.join(_os.path.expanduser("~"), "Pictures", "Lkey_Screenshots")
+                try:
+                    _os.makedirs(d, exist_ok=True)
+                    if hasattr(_os, "startfile"):
+                        _os.startfile(d)
+                    else:
+                        _sp.Popen(["explorer.exe", d])
+                except Exception as _e:
+                    state["last"] = f"Could not open captures: {_e}"
             icon = pystray.Icon("LkeySentinel", img, "Lkey Sentinel",
                                 menu=pystray.Menu(
                                     pystray.MenuItem(lambda i: state["last"], None, enabled=False),
                                     pystray.MenuItem("Check for updates", _check_updates),
                                     pystray.MenuItem("\U0001f4f8 Screenshot", _screenshot),
+                                    pystray.MenuItem("Open captures folder", _open_caps),
                                     pystray.MenuItem("Free memory (safe)", _free_mem),
                                     pystray.MenuItem("Quit", _quit)))
             import threading
