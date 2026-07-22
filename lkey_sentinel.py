@@ -148,6 +148,9 @@ DEFAULTS = {
     "vram_percent_warn": 94,    # % — VRAM pressure precedes many game crashes
     "sustain_samples": 3,       # consecutive readings a condition must hold before an alert may speak
     "history_ring": 12,         # keep last N samples in the black box on alert
+    "beacon_animate": True,    # tray orb breathes; False = static colour, no blink EVER
+    "event_flash_seconds": 6,   # how long the blue "event logged" flash holds
+    "panel_mode": "dark",       # Panel skin: dark | glass (Glass Engine) — click the Panel orb to cycle
 }
 
 
@@ -226,6 +229,44 @@ def _flight_record(s):
 _BREACH_STREAK = {}
 
 
+# ---------------------------------------------------------------
+# [BEACON] Shared status truth for the tray orb + panel.
+# The beacon NEVER senses anything itself: it is the existing
+# Honest Alert machinery made visible.
+#   GREEN  calm
+#   YELLOW breach building — the hysteresis counting 1..2 before
+#          an alert may speak, made visible
+#   RED    sustained danger (an alert is live)
+#   BLUE   an event of interest was just written to disk
+#          (crash record / blackbox) — flashes, then returns to truth
+# ---------------------------------------------------------------
+_BEACON = {"state": "green", "event_until": 0.0, "flash_secs": 6.0,
+           "sample": {}, "last": ""}
+
+
+def beacon_set(state):
+    """Set the underlying truth colour (green/yellow/red)."""
+    if state in ("green", "yellow", "red"):
+        _BEACON["state"] = state
+
+
+def beacon_event():
+    """A moment of interest just landed on disk (crash record or
+    blackbox). The orb flashes BLUE briefly, then returns to truth."""
+    try:
+        secs = float(_BEACON.get("flash_secs", 6.0))
+    except (TypeError, ValueError):
+        secs = 6.0
+    _BEACON["event_until"] = time.time() + max(1.0, secs)
+
+
+def beacon_state():
+    """What the orb should show RIGHT NOW (blue overrides briefly)."""
+    if time.time() < _BEACON["event_until"]:
+        return "blue"
+    return _BEACON["state"]
+
+
 def evaluate(s, cfg):
     """Return list of (level, message) warnings for this sample.
 
@@ -260,6 +301,7 @@ def evaluate(s, cfg):
 
 def write_blackbox(ring, alerts):
     """On alert, dump the recent sample ring so the pre-crash state survives."""
+    beacon_event()   # [BEACON] blue flash: a blackbox just hit the disk
     try:
         BLACKBOX.parent.mkdir(parents=True, exist_ok=True)
         with open(BLACKBOX, "a", encoding="utf-8") as f:
@@ -413,6 +455,7 @@ def detect_crashes(prev_procs, now_procs, vitals_ring, say, notify_telegram=True
         if match:
             say(f"💥 {name} CRASHED — faulting module: {match['faulting_module']}")
             _log_crash(name, match["faulting_module"], match["detail"], vitals_ring, True)
+            beacon_event()   # [BEACON] blue flash: crash record written
             if notify_telegram:
                 _mach = machine or machine_label()
                 _crash_sig = f"{name} {match['faulting_module']}"
@@ -452,6 +495,16 @@ def watch(cfg, notify=None, stop=lambda: False):
             pass
         prev_procs = now_procs
         alerts = evaluate(s, cfg)
+        # [BEACON] turn the streak machinery into colour truth
+        _BEACON["sample"] = s
+        _BEACON["flash_secs"] = float(cfg.get("event_flash_seconds", 6))
+        _need_b = int(cfg.get("sustain_samples", 3))
+        if alerts:
+            beacon_set("red")
+        elif any(0 < v < _need_b for v in _BREACH_STREAK.values()):
+            beacon_set("yellow")
+        else:
+            beacon_set("green")
         if alerts:
             now = time.time()
             # signature of WHICH conditions are firing (e.g. "VRAM;RAM")
@@ -628,6 +681,373 @@ def free_browser_tabs(dry_run=True, notify=print):
     return freed
 
 
+# ---------------------------------------------------------------
+# [BEACON] The orb, its frames, the Panel, and the tray runner.
+# Research-verified (Grok + Gemini, independently): the Windows tray
+# can only ever display a static icon, so all animation is swapping
+# pre-rendered frames. We render every frame ONCE at startup —
+# negligible CPU, no per-tick drawing, no GDI leak risk (pystray
+# manages the handles).
+# ---------------------------------------------------------------
+_BEACON_RGB = {
+    "green":  (72, 199, 116),
+    "yellow": (232, 176, 46),
+    "red":    (226, 61, 55),
+    "blue":   (66, 158, 235),
+}
+_BEACON_WORD = {
+    "green": "calm",
+    "yellow": "watching a rise",
+    "red": "DANGER sustained",
+    "blue": "event logged",
+}
+
+
+def _beacon_frames(animate=True, size=64, steps=20):
+    """Pre-render every orb frame at startup. animate=False builds a
+    single calm frame per colour — the photosensitivity law: with the
+    breath off there is NO periodic redraw at all, only a swap when
+    the state itself changes."""
+    from PIL import Image, ImageDraw
+    import math
+    frames = {}
+    for name, (r, g, b) in _BEACON_RGB.items():
+        seq = []
+        n = steps if animate else 1
+        for i in range(n):
+            phase = math.sin(2 * math.pi * i / n) if animate else 0.0
+            rad = 20 + 3 * phase                       # gentle breath, +/-3px
+            glow = int(60 + 35 * (phase + 1) / 2)      # halo follows softly
+            img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            c = size / 2
+            d.ellipse([c - rad - 5, c - rad - 5, c + rad + 5, c + rad + 5],
+                      fill=(r, g, b, glow))
+            d.ellipse([c - rad, c - rad, c + rad, c + rad],
+                      fill=(r, g, b, 255))
+            seq.append(img)
+        frames[name] = seq
+    return frames
+
+
+def _open_panel(state, cfg, actions):
+    """[PANEL v1] Optional always-on-top mini window. PURE STDLIB tkinter
+    so the public tool stays dependency-light for gamers. Sanctuary-dark
+    live bars (CPU / RAM / GPU / VRAM-with-GB) + a sparkline fed straight
+    from sentinel_readings.csv — the flight recorder becomes the chart.
+    Every tool the old tray menu carried lives here as a button now.
+    Thread hygiene: ALL tk calls stay inside the panel's own thread; the
+    tray thread only sets flags, never touches widgets."""
+    if state.get("panel_alive"):
+        state["panel_lift"] = True       # tick() inside the panel handles it
+        return
+    import threading
+
+    def _run():
+        try:
+            import tkinter as tk
+        except Exception:
+            _BEACON["last"] = "Panel needs tkinter (python.org builds include it)"
+            return
+        mode = str(cfg.get("panel_mode", "dark")).lower()
+        if mode == "glass":   # [GLASS ENGINE] the Sanctuary sensory mode, on the Panel
+            BG, FG, DIM, ACC = "#050505", "#00EE66", "#008833", "#00FF88"
+            BAR_BG, BTN_BG, BTN_ABG = "#0A0A0A", "#031503", "#052505"
+            _alpha = 0.85
+        else:                 # Sanctuary dark (default)
+            BG, FG, DIM, ACC = "#121417", "#d7dde2", "#8b949e", "#8FBC8F"
+            BAR_BG, BTN_BG, BTN_ABG = "#232a31", "#1b2026", "#232a31"
+            _alpha = 1.0
+        COLS = {"green": "#48c774", "yellow": "#e8b02e",
+                "red": "#e23d37", "blue": "#429eeb"}
+        state["panel_alive"] = True
+        root = tk.Tk()
+        root.title("Lkey Sentinel")
+        root.configure(bg=BG)
+        root.attributes("-topmost", True)
+        root.resizable(False, False)
+        try:
+            root.attributes("-alpha", _alpha)   # [GLASS ENGINE] translucency
+        except Exception:
+            pass
+
+        head = tk.Canvas(root, width=304, height=32, bg=BG, highlightthickness=0)
+        head.pack(padx=12, pady=(10, 0))
+        bars = tk.Canvas(root, width=304, height=118, bg=BG, highlightthickness=0)
+        bars.pack(padx=12)
+        spark = tk.Canvas(root, width=304, height=64, bg=BG, highlightthickness=0)
+        spark.pack(padx=12, pady=(6, 2))
+        last = tk.Label(root, bg=BG, fg=DIM, font=("Segoe UI", 8),
+                        wraplength=294, justify="left", anchor="w")
+        last.pack(padx=12, fill="x")
+        btnrow = tk.Frame(root, bg=BG)
+        btnrow.pack(padx=12, pady=(4, 10), fill="x")
+        for i in range(2):
+            btnrow.columnconfigure(i, weight=1)
+        for idx, (label, fn) in enumerate(actions.items()):
+            tk.Button(btnrow, text=label, command=fn, bg=BTN_BG, fg=FG,
+                      activebackground=BTN_ABG, activeforeground=FG,
+                      relief="flat", font=("Segoe UI", 8), padx=6, pady=3
+                      ).grid(row=idx // 2, column=idx % 2,
+                             padx=3, pady=2, sticky="ew")
+
+        def bar(y, label, val, text):
+            bars.create_text(4, y, anchor="w", fill=FG,
+                             font=("Segoe UI", 8), text=label)
+            x0, x1 = 56, 300
+            bars.create_rectangle(x0, y - 5, x1, y + 5,
+                                  outline=BAR_BG, width=1)
+            if isinstance(val, (int, float)):
+                frac = max(0.0, min(1.0, float(val) / 100.0))
+                bars.create_rectangle(x0, y - 5, x0 + frac * (x1 - x0), y + 5,
+                                      fill=ACC, width=0)
+            bars.create_text(x1, y - 12, anchor="e", fill=DIM,
+                             font=("Segoe UI", 7), text=text)
+
+        def _spark_points():
+            try:
+                lines = FLIGHT_LOG.read_text(encoding="utf-8").strip().splitlines()
+                if len(lines) < 3:
+                    return [], ""
+                hdr = lines[0].split(",")
+                col = "gpu_temp" if "gpu_temp" in hdr else "cpu"
+                ci = hdr.index(col)
+                pts = []
+                for ln in lines[-120:]:
+                    parts = ln.split(",")
+                    if parts and parts[0] != "date" and len(parts) > ci:
+                        try:
+                            pts.append(float(parts[ci]))
+                        except ValueError:
+                            pass
+                return pts, col
+            except Exception:
+                return [], ""
+
+        def tick():
+            if not state.get("panel_alive"):
+                return
+            if state.pop("panel_lift", False):
+                try:
+                    root.deiconify()
+                    root.lift()
+                    root.attributes("-topmost", True)
+                except Exception:
+                    pass
+            s = dict(_BEACON.get("sample") or {})
+            st = beacon_state()
+            head.delete("all")
+            head.create_oval(4, 7, 22, 25, fill=COLS.get(st, ACC), width=0)
+            head.create_text(30, 16, anchor="w", fill=FG,
+                             font=("Segoe UI", 10, "bold"),
+                             text=f"{_BEACON_WORD[st]} · {machine_label()}")
+            bars.delete("all")
+            cpu_txt = f"{s.get('cpu', '--')}%"
+            if s.get("cpu_temp") is not None:
+                cpu_txt += f" · {s['cpu_temp']}°C"
+            bar(16, "CPU", s.get("cpu"), cpu_txt)
+            ram_txt = f"{s.get('ram', '--')}%"
+            if "ram_used_gb" in s:
+                ram_txt += f" · {s['ram_used_gb']} GB"
+            bar(44, "RAM", s.get("ram"), ram_txt)
+            if "gpu_load" in s or "gpu_temp" in s:
+                gpu_txt = f"{s.get('gpu_load', '--')}%"
+                if "gpu_temp" in s:
+                    gpu_txt += f" · {s['gpu_temp']}°C"
+            else:
+                gpu_txt = "no NVML"
+            bar(72, "GPU", s.get("gpu_load"), gpu_txt)
+            if "vram" in s:
+                vr_txt = f"{s.get('vram', '--')}%"
+                if "vram_total_gb" in s:
+                    vr_txt += (f" · {s.get('vram_used_gb', '?')}"
+                               f"/{s.get('vram_total_gb', '?')} GB")
+            else:
+                vr_txt = "no NVML"
+            bar(100, "VRAM", s.get("vram"), vr_txt)
+            spark.delete("all")
+            pts, col = _spark_points()
+            spark.create_text(4, 8, anchor="w", fill=DIM, font=("Segoe UI", 7),
+                              text=f"flight recorder · {col or 'no data yet'}")
+            if len(pts) >= 2:
+                lo, hi = min(pts), max(pts)
+                span = (hi - lo) or 1.0
+                w, h = 304, 64
+                step = (w - 8) / (len(pts) - 1)
+                coords = []
+                for i2, v in enumerate(pts):
+                    coords += [4 + i2 * step,
+                               h - 6 - (v - lo) / span * (h - 22)]
+                spark.create_line(*coords, fill=ACC, width=1)
+                spark.create_text(300, 8, anchor="e", fill=DIM,
+                                  font=("Segoe UI", 7), text=f"{lo:.0f}-{hi:.0f}")
+            if _BEACON.get("last"):
+                last.config(text=_BEACON["last"][:160])
+            root.after(2000, tick)
+
+        def on_close():
+            state["panel_alive"] = False
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+        root.protocol("WM_DELETE_WINDOW", on_close)
+
+        def _cycle_mode(_e=None):
+            # [GLASS ENGINE] click the orb: dark <-> glass, remembered in config
+            new_mode = "glass" if mode != "glass" else "dark"
+            cfg["panel_mode"] = new_mode
+            try:
+                _cur = {}
+                try:
+                    _cur = json.loads(CFG.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+                _cur["panel_mode"] = new_mode
+                CFG.write_text(json.dumps(_cur, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+            on_close()
+            _open_panel(state, cfg, actions)
+        head.bind("<Button-1>", _cycle_mode)
+        tick()
+        try:
+            root.mainloop()
+        finally:
+            state["panel_alive"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def run_tray(cfg):
+    """[BEACON] The tray IS the status: an orb wearing the Honest Alert's
+    colour truth. Monk-minimal menu — Show Panel (left-click default) and
+    Quit. Tooltip carries a SHORT state word only; the old long status
+    line stretched the taskbar. Every tool the menu used to carry now
+    lives as a Panel button: nothing shipped was lost, it moved indoors."""
+    import pystray
+    import threading
+    animate = bool(cfg.get("beacon_animate", True))
+    frames = _beacon_frames(animate=animate)
+    state = {"stop": False, "panel_alive": False, "panel_lift": False}
+
+    def report(m):
+        _BEACON["last"] = m
+
+    # ---- the kept tools (moved from menu to Panel buttons) ----
+    def act_screenshot():                 # [EYES-V2] all screens + reveal + telegram
+        def _do():
+            try:
+                from PIL import ImageGrab
+                import os
+                import subprocess
+                from datetime import datetime
+                shots = os.path.join(os.path.expanduser("~"),
+                                     "Pictures", "Lkey_Screenshots")
+                os.makedirs(shots, exist_ok=True)
+                _drop_safety_note(shots)
+                fname = os.path.join(
+                    shots, f"screenshot_{datetime.now():%Y%m%d_%H%M%S}.png")
+                try:
+                    ImageGrab.grab(all_screens=True).save(fname)
+                except TypeError:
+                    ImageGrab.grab().save(fname)   # older PIL: primary only
+                report(f"\U0001f4f8 Saved: {os.path.basename(fname)}")
+                try:   # reveal in Explorer with the new file selected
+                    subprocess.Popen(
+                        ["explorer", "/select,", os.path.normpath(fname)])
+                except Exception:
+                    pass
+                if send_telegram_photo(fname,
+                                       f"\U0001f4f8 {machine_label()} screenshot"):
+                    report(_BEACON["last"] + " + sent to Telegram")
+            except Exception as _e:
+                report(f"Screenshot failed: {_e}")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def act_open_caps():                  # [EYES-V2]
+        import os as _os
+        import subprocess as _sp
+        d = _os.path.join(_os.path.expanduser("~"),
+                          "Pictures", "Lkey_Screenshots")
+        try:
+            _os.makedirs(d, exist_ok=True)
+            if hasattr(_os, "startfile"):
+                _os.startfile(d)
+            else:
+                _sp.Popen(["explorer.exe", d])
+        except Exception as _e:
+            report(f"Could not open captures: {_e}")
+
+    def act_free_mem():
+        def _do():
+            try:
+                free_browser_tabs(dry_run=False, notify=report)
+            except Exception as _e:
+                report(f"Free memory failed: {_e}")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def act_check_updates():
+        def _do():
+            try:
+                from sentinel_updater import check_for_updates
+                check_for_updates(notify=report, apply=True)
+            except Exception as _e:
+                report(f"Update check failed: {_e}")
+        threading.Thread(target=_do, daemon=True).start()
+
+    actions = {
+        "\U0001f4f8 Screenshot": act_screenshot,
+        "Open captures": act_open_caps,
+        "Free memory (safe)": act_free_mem,
+        "Check for updates": act_check_updates,
+    }
+
+    def _quit(icon, item):
+        state["stop"] = True
+        state["panel_alive"] = False
+        icon.stop()
+
+    def _show_panel(icon=None, item=None):
+        _open_panel(state, cfg, actions)
+
+    # menu: choice AND fluidity — every Panel tool lives here too, short
+    # labels only; the long status line that stretched the taskbar stays
+    # gone. Built from the SAME actions dict as the Panel buttons: one
+    # source of truth, change once, both surfaces update.
+    _menu_items = [pystray.MenuItem("Show Panel", _show_panel, default=True)]
+    for _lbl, _fn in actions.items():
+        _menu_items.append(pystray.MenuItem(_lbl, (lambda f: (lambda *a: f()))(_fn)))
+    _menu_items.append(pystray.MenuItem("Quit", _quit))
+    icon = pystray.Icon(
+        "LkeySentinel", frames["green"][0], "Lkey Sentinel — calm",
+        menu=pystray.Menu(*_menu_items))
+
+    def _animate():
+        i = 0
+        shown = None
+        while not state["stop"]:
+            st = beacon_state()
+            seq = frames[st]
+            if animate:
+                icon.icon = seq[i % len(seq)]
+                i += 1
+            elif st != shown:
+                icon.icon = seq[0]        # static law: swap ONLY on change
+            if st != shown:
+                icon.title = f"Lkey Sentinel — {_BEACON_WORD[st]}"
+                shown = st
+            time.sleep(0.12 if animate else 0.5)
+
+    def _watch():
+        watch(cfg, notify=report, stop=lambda: state["stop"])
+
+    threading.Thread(target=_watch, daemon=True).start()
+    threading.Thread(target=_animate, daemon=True).start()
+    icon.run()                            # must own the main thread on Windows
+
+
 def main():
     # apply any verified update that was staged on a previous run (safe: nothing
     # is running from the file yet). Never blocks startup if it fails.
@@ -648,103 +1068,7 @@ def main():
         return
     if "--tray" in sys.argv:
         try:
-            import pystray
-            from PIL import Image, ImageDraw
-            img = Image.new("RGB", (64, 64), (10, 10, 10))
-            d = ImageDraw.Draw(img)
-            d.ellipse([16, 16, 48, 48], fill=(0, 200, 0))
-            state = {"stop": False, "last": "starting..."}
-            def _quit(icon, item):
-                state["stop"] = True
-                icon.stop()
-            def _free_mem(icon, item):
-                free_browser_tabs(dry_run=False, notify=lambda m: setattr(state, "last", m) if False else state.update(last=m))
-            def _check_updates(icon, item):
-                def _do():
-                    try:
-                        from sentinel_updater import check_for_updates
-                        def _report(msg):
-                            state["last"] = msg
-                            try:
-                                icon.update_menu()
-                            except Exception:
-                                pass
-                        check_for_updates(notify=_report, apply=True)
-                    except Exception as _e:
-                        state["last"] = f"Update check failed: {_e}"
-                        try:
-                            icon.update_menu()
-                        except Exception:
-                            pass
-                import threading as _th
-                _th.Thread(target=_do, daemon=True).start()
-            def _screenshot(icon, item):          # [EYES-V2] all screens + reveal + telegram
-                def _do():
-                    try:
-                        from PIL import ImageGrab
-                        import os
-                        import subprocess
-                        from datetime import datetime
-                        shots = os.path.join(os.path.expanduser("~"), "Pictures", "Lkey_Screenshots")
-                        os.makedirs(shots, exist_ok=True)
-                        _drop_safety_note(shots)
-                        fname = os.path.join(shots, f"screenshot_{datetime.now():%Y%m%d_%H%M%S}.png")
-                        try:
-                            ImageGrab.grab(all_screens=True).save(fname)
-                        except TypeError:
-                            ImageGrab.grab().save(fname)   # older PIL: primary screen only
-                        state["last"] = f"\U0001f4f8 Saved: {os.path.basename(fname)}"
-                        try:  # reveal in Explorer with the new file selected — no hunting
-                            subprocess.Popen(["explorer", "/select,", os.path.normpath(fname)])
-                        except Exception:
-                            pass
-                        if send_telegram_photo(fname, f"\U0001f4f8 {machine_label()} screenshot"):
-                            state["last"] += " + sent to Telegram"
-                    except Exception as _e:
-                        state["last"] = f"Screenshot failed: {_e}"
-                    try:
-                        icon.update_menu()
-                    except Exception:
-                        pass
-                import threading as _th
-                _th.Thread(target=_do, daemon=True).start()
-
-            def _open_caps(icon=None, item=None):   # [EYES-V2]
-                import os as _os
-                import subprocess as _sp
-                d = _os.path.join(_os.path.expanduser("~"), "Pictures", "Lkey_Screenshots")
-                try:
-                    _os.makedirs(d, exist_ok=True)
-                    if hasattr(_os, "startfile"):
-                        _os.startfile(d)
-                    else:
-                        _sp.Popen(["explorer.exe", d])
-                except Exception as _e:
-                    state["last"] = f"Could not open captures: {_e}"
-            icon = pystray.Icon("LkeySentinel", img, "Lkey Sentinel",
-                                menu=pystray.Menu(
-                                    pystray.MenuItem(lambda i: state["last"], None, enabled=False),
-                                    pystray.MenuItem("Check for updates", _check_updates),
-                                    pystray.MenuItem("\U0001f4f8 Screenshot", _screenshot),
-                                    pystray.MenuItem("Open captures folder", _open_caps),
-                                    pystray.MenuItem("Free memory (safe)", _free_mem),
-                                    pystray.MenuItem("Quit", _quit)))
-            import threading
-            def run():
-                def note(m):
-                    state["last"] = m
-                    icon.title = "Lkey Sentinel: " + m[:40]
-                    # refresh the menu so the status label actually updates
-                    try:
-                        icon.update_menu()
-                    except Exception:
-                        pass
-                # flip from "starting..." to an active status once the watch loop begins
-                import socket as _sock
-                note(f"\u2705 Watching {_sock.gethostname()} \u2014 all clear")
-                watch(cfg, notify=note, stop=lambda: state["stop"])
-            threading.Thread(target=run, daemon=True).start()
-            icon.run()
+            run_tray(cfg)
             return
         except Exception as e:
             print(f"(tray unavailable: {e} — running in console instead)")

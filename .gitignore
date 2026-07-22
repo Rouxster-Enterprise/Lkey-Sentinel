@@ -17,3 +17,6 @@ __pycache__/
 # staged update temp files
 *.staged
 VERSION.staged
+
+# surgery attics - lineage stays local
+kit_attic*/
