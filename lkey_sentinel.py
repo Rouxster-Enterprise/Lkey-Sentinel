@@ -1064,11 +1064,21 @@ def _doctor_procs(top=8):
             except Exception:
                 continue
         time.sleep(0.4)                     # one short window for real CPU %
+        # [DOCTOR v1.1] the idle process is the CPU NOT being used —
+        # listing it as "heaviest" is nonsense and hides the real cause.
+        _skip = {"system idle process", "idle", "system", ""}
+        try:
+            _cores = max(1, psutil.cpu_count() or 1)
+        except Exception:
+            _cores = 1
         rows = []
         for p in procs:
             try:
-                rows.append((p.info.get("name") or "?",
-                             p.cpu_percent(None),
+                _nm = p.info.get("name") or "?"
+                if _nm.lower() in _skip:
+                    continue
+                rows.append((_nm,
+                             p.cpu_percent(None) / _cores,   # normalised: 100% = whole machine
                              (p.info.get("memory_info").rss if p.info.get("memory_info") else 0) / 1e9))
             except Exception:
                 continue
